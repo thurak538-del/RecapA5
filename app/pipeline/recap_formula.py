@@ -5,13 +5,17 @@ segments; Gemini never owns timestamps.
 """
 import difflib
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 
 LogFn = Callable[[str, float], None]
 
-BATCH_MAX_ITEMS = 40
+BATCH_MAX_ITEMS = 30        # translate/audit window (output is Burmese = many tokens, keep it moderate)
 BATCH_MAX_CHARS = 24000
+CONTEXT_BATCH_ITEMS = 120   # context memory only READS source text and returns a small JSON -> big chunks
+CONTEXT_BATCH_CHARS = 30000
 CONTEXT_ROWS = 6
 
 
@@ -40,11 +44,12 @@ def build_units(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def _batches(units: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+def _batches(units: List[Dict[str, Any]], max_items: int = BATCH_MAX_ITEMS,
+             max_chars: int = BATCH_MAX_CHARS) -> List[List[Dict[str, Any]]]:
     out, cur, chars = [], [], 0
     for u in units:
         cost = len(u["source_text"]) + 96
-        if cur and (len(cur) >= BATCH_MAX_ITEMS or chars + cost > BATCH_MAX_CHARS):
+        if cur and (len(cur) >= max_items or chars + cost > max_chars):
             out.append(cur)
             cur, chars = [], 0
         cur.append(u)
@@ -63,6 +68,18 @@ def _translation_lines(items: List[Dict[str, Any]]) -> str:
         f"[ID {int(x['id']):05d}] [{x['timestamp']}] SOURCE: {x['source_text']}\n"
         f"OUTPUT: {_clean(x.get('translation'))}" for x in items
     )
+
+
+def _context_lines(items: List[Dict[str, Any]]) -> str:
+    """Read-only context rows: show SOURCE/OUTPUT when a translation exists, plain source otherwise."""
+    lines = []
+    for x in items:
+        head = f"[ID {int(x['id']):05d}] [{x['timestamp']}]"
+        if x.get("translation"):
+            lines.append(f"{head} SOURCE: {x['source_text']}\nOUTPUT: {_clean(x['translation'])}")
+        else:
+            lines.append(f"{head} {x['source_text']}")
+    return "\n".join(lines)
 
 
 def _duplicate_pairs(items, previous=None) -> List[tuple]:
@@ -93,7 +110,7 @@ def _check_rows(items, previous=None) -> None:
 def build_story_context(rw, units, model_order, log: LogFn) -> Dict[str, Any]:
     memory: Dict[str, Any] = {k: [] for k in
         ("characters", "relationships", "places", "terms", "plot_state", "name_consistency", "unresolved")}
-    chunks = _batches(units)
+    chunks = _batches(units, CONTEXT_BATCH_ITEMS, CONTEXT_BATCH_CHARS)
     for i, chunk in enumerate(chunks, 1):
         prompt = f"""
 You are building CONTEXT MEMORY for a later translation task.
@@ -159,7 +176,7 @@ STORY CONTEXT MEMORY:
 {json.dumps(story_context, ensure_ascii=False)}
 
 PREVIOUS CONTEXT (READ-ONLY):
-{_translation_lines(previous) if previous else '(none)'}
+{_context_lines(previous) if previous else '(none)'}
 
 CURRENT ITEMS — CONVERT ALL OF THESE, ONE-FOR-ONE:
 {_source_lines(current)}
@@ -302,25 +319,61 @@ Your checks[].id list MUST equal exactly: {ids_json}
 def run_recap_formula(rw, segments, model_order, lang_name, progress=None):
     """Return (context, [{id,start,end,text}]) for Recap mode."""
     def log(msg: str, pct: float) -> None:
-        if progress and pct >= 0:
-            progress(msg, pct)
+        if pct >= 0:
+            if progress:
+                progress(msg, pct)
+        else:
+            print(f"[Recap] {msg}", flush=True)   # retries / splits / audit results -> console only
 
     units = build_units(segments)
     context = build_story_context(rw, units, model_order, log)
     batches = _batches(units)
-    done: List[Dict[str, Any]] = []
-    for i, batch in enumerate(batches, 1):
-        start = sum(len(b) for b in batches[:i - 1])
-        prev = done[-CONTEXT_ROWS:]
-        nxt = units[start + len(batch): start + len(batch) + CONTEXT_ROWS]
-        tr = translate_batch(rw, model_order, lang_name=lang_name, story_context=context,
-                             previous=prev, current=batch, nxt=nxt, log=log)
-        try:
-            tr = audit_batch(rw, model_order, tr, story_context=context, previous=prev, nxt=nxt, log=log)
-        except Exception as exc:
-            log(f"Audit skipped for batch {i} ({exc}); keeping validated translation", -1)
-        done.extend(tr)
-        log(f"Recap translate+audit {i}/{len(batches)}", 35.0 + 50.0 * i / len(batches))
+    starts, pos = [], 0
+    for b in batches:
+        starts.append(pos)
+        pos += len(b)
+
+    def src_before(i):          # read-only source rows just before batch i
+        return units[max(0, starts[i] - CONTEXT_ROWS): starts[i]]
+
+    def src_after(i):           # read-only look-ahead rows just after batch i
+        end = starts[i] + len(batches[i])
+        return units[end: end + CONTEXT_ROWS]
+
+    workers = int(os.getenv("RECAP_GEMINI_WORKERS", "0") or 0) or min(4, len(getattr(rw, "clients", [1])) + 1)
+    workers = max(1, min(workers, len(batches)))
+
+    # PHASE A - translate all windows in parallel (story context keeps names consistent).
+    translated: List[Any] = [None] * len(batches)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(translate_batch, rw, model_order, lang_name=lang_name, story_context=context,
+                            previous=src_before(i), current=b, nxt=src_after(i), log=log): i
+                for i, b in enumerate(batches)}
+        finished = 0
+        for fut in as_completed(futs):
+            translated[futs[fut]] = fut.result()
+            finished += 1
+            log(f"Recap translate {finished}/{len(batches)}", 35.0 + 37.0 * finished / len(batches))
+
+    # PHASE B - audit all windows in parallel (now the previous window's translation is known).
+    audited: List[Any] = list(translated)
+    if os.getenv("RECAP_SKIP_AUDIT", "0") != "1":
+        def run_audit(i):
+            prev = translated[i - 1][-CONTEXT_ROWS:] if i > 0 else []
+            try:
+                return audit_batch(rw, model_order, translated[i], story_context=context,
+                                   previous=prev, nxt=src_after(i), log=log)
+            except Exception as exc:
+                log(f"Audit skipped for batch {i + 1} ({exc}); keeping validated translation", -1)
+                return translated[i]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(run_audit, i): i for i in range(len(batches))}
+            finished = 0
+            for fut in as_completed(futs):
+                audited[futs[fut]] = fut.result()
+                finished += 1
+                log(f"Recap audit {finished}/{len(batches)}", 72.0 + 13.0 * finished / len(batches))
+    done: List[Dict[str, Any]] = [row for part in audited for row in part]
     by_id = {x["id"]: x["translation"] for x in done}
     return context, [{"id": s["id"], "start": float(s["start"]), "end": float(s["end"]),
                       "text": by_id[s["id"]]} for s in segments]
