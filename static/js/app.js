@@ -862,6 +862,9 @@ videoFileInput.addEventListener("change", () => {
 // Progress UI
 // ──────────────────────────────────────────────
 function updateProgressUI(stageName, stageIdx, percent, message) {
+  // Polled job state has no stage_index; derive it from the stage name so the bar/chips stay correct.
+  const byName = BURMESE_STAGES.indexOf(stageName);
+  if (byName >= 0) stageIdx = byName + 1;
   const safeMessage = cleanUserStatusMessage(message || stageName || "...");
   if (currentStageLabel) currentStageLabel.innerText = cleanUserStatusMessage(stageName || "...");
   if (stageDetailMsg) stageDetailMsg.innerText = safeMessage;
