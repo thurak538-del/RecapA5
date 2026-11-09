@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Tuple
@@ -40,8 +42,6 @@ class GeminiRewriter:
         "gemini-3.5-flash",
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash",
     ]
 
     def __init__(self, api_key, progress_callback: Optional[Callable[[str, float], None]] = None):
@@ -51,13 +51,39 @@ class GeminiRewriter:
         if not keys:
             raise ValueError("Gemini API Key is required. Please set it in Settings.")
         self.api_keys = keys
-        self.clients = [genai.Client(api_key=k) for k in keys]
+        # A hung request must not freeze the whole job: 120s timeout per call.
+        timeout_ms = int(float(os.getenv("RECAP_GEMINI_TIMEOUT_S", "120")) * 1000)
+        self.clients = [self._make_client(k, timeout_ms) for k in keys]
+        self._lock = threading.Lock()      # _generate() is called from several worker threads
+        self._no_thinking: set = set()     # models that rejected our thinking setting
         self.client = self.clients[0]
         self.progress_callback = progress_callback
         self._cur = 0                      # next key to use (round-robin)
         self._cooldown: Dict[Tuple[int, str], float] = {}   # (key, model) -> monotonic time it is usable again
         self._exhausted: set = set()       # (key, model) whose daily free quota is used up
         self._bad_keys: set = set()        # keys Google rejected as invalid
+
+    @staticmethod
+    def _make_client(key: str, timeout_ms: int):
+        try:
+            return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms))
+        except Exception:
+            return genai.Client(api_key=key)   # very old google-genai without HttpOptions
+
+    def _thinking_config(self, model: str):
+        """Translation does not need hidden reasoning. Gemini Flash 'thinks' by default, which
+        makes every call several times slower. Turn it off / down where the model allows it."""
+        if model in self._no_thinking or os.getenv("RECAP_GEMINI_THINKING", "off") != "off":
+            return None
+        name = model.lower()
+        try:
+            if "2.5" in name:
+                return None if "pro" in name else types.ThinkingConfig(thinking_budget=0)
+            if "2.0" in name or "1.5" in name:
+                return None
+            return types.ThinkingConfig(thinking_level="low")   # Gemini 3.x and *-latest aliases
+        except Exception:
+            return None    # installed google-genai is too old for this field
 
     @staticmethod
     def _extract_json(text: str) -> Dict[str, Any]:
@@ -164,19 +190,22 @@ class GeminiRewriter:
 
     def _pick_key(self, model: str) -> Tuple[Optional[int], Optional[float]]:
         """Return (key_index, 0) if a key is usable now, (None, seconds) if all are cooling down,
-        or (None, None) if every key is exhausted/invalid for this model."""
-        n = len(self.clients)
-        now = time.monotonic()
-        shortest: Optional[float] = None
-        for off in range(n):
-            i = (self._cur + off) % n
-            if i in self._bad_keys or (i, model) in self._exhausted:
-                continue
-            wait = self._cooldown.get((i, model), 0.0) - now
-            if wait <= 0:
-                return i, 0.0
-            shortest = wait if shortest is None else min(shortest, wait)
-        return None, shortest
+        or (None, None) if every key is exhausted/invalid for this model.
+        The round-robin pointer moves at pick time so parallel workers spread over the keys."""
+        with self._lock:
+            n = len(self.clients)
+            now = time.monotonic()
+            shortest: Optional[float] = None
+            for off in range(n):
+                i = (self._cur + off) % n
+                if i in self._bad_keys or (i, model) in self._exhausted:
+                    continue
+                wait = self._cooldown.get((i, model), 0.0) - now
+                if wait <= 0:
+                    self._cur = (i + 1) % n
+                    return i, 0.0
+                shortest = wait if shortest is None else min(shortest, wait)
+            return None, shortest
 
     def _generate(self, prompt: str, model_candidates: List[str], temperature: float = 0.15) -> str:
         last_err = None
@@ -192,43 +221,54 @@ class GeminiRewriter:
                     print(f"[Gemini] {candidate}: all {n_keys} key(s) rate-limited, waiting {wait:.0f}s", flush=True)
                     time.sleep(wait)
                     continue
+                thinking = self._thinking_config(candidate)
+                cfg = dict(temperature=temperature, response_mime_type="application/json")
+                if thinking is not None:
+                    cfg["thinking_config"] = thinking
+                started = time.monotonic()
                 try:
                     response = self.clients[idx].models.generate_content(
                         model=candidate,
                         contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=temperature,
-                            response_mime_type="application/json",
-                        ),
+                        config=types.GenerateContentConfig(**cfg),
                     )
-                    if response.text:
-                        self._cur = (idx + 1) % n_keys   # round-robin: next request uses the next key
-                        return response.text
+                    text = response.text
+                    print(f"[Gemini] {candidate} key#{idx + 1} ok in {time.monotonic() - started:.1f}s", flush=True)
+                    if text:
+                        return text
                     last_err = RuntimeError(f"{candidate} returned an empty response")
                     break
                 except Exception as exc:
                     last_err = exc
                     error_text = str(exc).lower()
+                    if thinking is not None and "thinking" in error_text and "429" not in error_text:
+                        # This model refuses our thinking setting: remember it and retry without it.
+                        print(f"[Gemini] {candidate}: thinking setting rejected, retrying without it", flush=True)
+                        with self._lock:
+                            self._no_thinking.add(candidate)
+                        continue
                     if any(t in error_text for t in ("api key not valid", "api_key_invalid", "permission_denied", "leaked")):
                         print(f"[Gemini] key #{idx + 1} was rejected by Google; skipping it", flush=True)
-                        self._bad_keys.add(idx)
-                        self._cur = (idx + 1) % n_keys
+                        with self._lock:
+                            self._bad_keys.add(idx)
                         continue
                     if "429" in error_text or "resource_exhausted" in error_text or "quota" in error_text:
                         if "perday" in error_text or "per day" in error_text:
                             print(f"[Gemini] key #{idx + 1} / {candidate}: daily free quota used up", flush=True)
-                            self._exhausted.add((idx, candidate))
+                            with self._lock:
+                                self._exhausted.add((idx, candidate))
                         else:
                             delay = self._retry_delay_seconds(error_text) or 30.0
-                            self._cooldown[(idx, candidate)] = time.monotonic() + min(delay + 1.5, 75.0)
+                            with self._lock:
+                                self._cooldown[(idx, candidate)] = time.monotonic() + min(delay + 1.5, 75.0)
                             print(f"[Gemini] key #{idx + 1} / {candidate}: rate limit (429), switching key", flush=True)
-                        self._cur = (idx + 1) % n_keys
                         continue
-                    transient = any(code in error_text for code in ("503", "500", "temporarily unavailable", "overloaded", "unavailable", "deadline"))
+                    transient = any(code in error_text for code in ("503", "500", "temporarily unavailable", "overloaded", "unavailable", "deadline", "timed out", "timeout"))
                     if transient and transient_tries < 3:
                         transient_tries += 1
                         time.sleep(2 * transient_tries)
                         continue
+                    print(f"[Gemini] {candidate} failed: {str(exc)[:200]}", flush=True)
                     break
         raise RuntimeError(f"Gemini API processing failed: {last_err}")
 
@@ -246,6 +286,9 @@ class GeminiRewriter:
 
     def _available_model_candidates(self) -> List[str]:
         """Add generate-capable Gemini models exposed by the current API key."""
+        forced = [m.strip() for m in os.getenv("RECAP_GEMINI_MODELS", "").split(",") if m.strip()]
+        if forced:
+            return list(dict.fromkeys(forced))   # user pinned the model list: skip listing, no guessing
         candidates = list(self.FALLBACK_MODELS)
         for client in self.clients:
             try:
