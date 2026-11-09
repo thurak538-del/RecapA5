@@ -21,13 +21,70 @@ LOG_DIR.mkdir(exist_ok=True)
 CLOUDFLARED = ROOT / "cloudflared"
 
 
+CLOUDFLARED_URLS = [
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+]
+
+
+def _is_valid_binary(path: Path) -> bool:
+    """A real cloudflared is a multi-MB Linux ELF file; anything else is a broken download."""
+    try:
+        if path.stat().st_size < 5_000_000:
+            return False
+        with path.open("rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _download(url: str, target: Path) -> bool:
+    """Download to a temp file; only a complete, valid file is moved into place."""
+    tmp = target.with_suffix(".part")
+    try:
+        if shutil.which("curl"):
+            result = subprocess.run(
+                ["curl", "-fL", "--retry", "3", "--retry-delay", "3", "--connect-timeout", "20",
+                 "--max-time", "240", "-o", str(tmp), url],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  curl failed: {result.stderr.strip()[-200:]}", flush=True)
+                return False
+        else:
+            urllib.request.urlretrieve(url, tmp)
+        if not _is_valid_binary(tmp):
+            print("  downloaded file is not a valid cloudflared binary", flush=True)
+            return False
+        tmp.replace(target)
+        return True
+    except Exception as exc:  # HTTP 5xx, DNS, timeout ...
+        print(f"  download error: {exc}", flush=True)
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def ensure_cloudflared() -> None:
     if CLOUDFLARED.exists():
-        return
-    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    print("Downloading cloudflared...", flush=True)
-    urllib.request.urlretrieve(url, CLOUDFLARED)
-    CLOUDFLARED.chmod(CLOUDFLARED.stat().st_mode | stat.S_IEXEC)
+        if _is_valid_binary(CLOUDFLARED):
+            CLOUDFLARED.chmod(CLOUDFLARED.stat().st_mode | stat.S_IEXEC)
+            return
+        print("Existing cloudflared file is broken; downloading again.", flush=True)
+        CLOUDFLARED.unlink(missing_ok=True)
+    # GitHub sometimes answers 502/504 for a few minutes, so retry with a growing pause.
+    for attempt in range(1, 9):
+        for url in CLOUDFLARED_URLS:
+            print(f"Downloading cloudflared (attempt {attempt}/8)...", flush=True)
+            if _download(url, CLOUDFLARED):
+                CLOUDFLARED.chmod(CLOUDFLARED.stat().st_mode | stat.S_IEXEC)
+                print("cloudflared ready.", flush=True)
+                return
+        wait = min(5 * attempt, 30)
+        print(f"Retrying in {wait}s...", flush=True)
+        time.sleep(wait)
+    raise RuntimeError(
+        "cloudflared could not be downloaded (GitHub is not answering). "
+        "Wait a few minutes and run this cell again."
+    )
 
 
 def server_ready() -> bool:
